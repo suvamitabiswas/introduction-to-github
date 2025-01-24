@@ -1,0 +1,532 @@
+import boto3
+import csv
+import os
+import re
+
+from datetime import datetime, timedelta
+from abc import ABC, abstractmethod
+from azure.data.tables import TableServiceClient
+
+sts_client = boto3.client('sts')
+
+tag_004_data = {}
+exempted_resources_map = {}
+wk_supported_regions = [
+    "us-east-1",
+    # "us-east-2",
+    # "us-west-1",
+    # "us-west-2",
+    # "eu-north-1",
+    # "eu-west-1",
+    # "eu-west-2",
+    # "eu-west-3",
+    # "eu-central-1"
+]
+domain_rulename_map = {
+    "Cloud-Tagging": ["wk_tag_001_wk_division_code_tag_check",
+                      "wk_tag_002_wk_bu_code_tag_check",
+                      "wk_tag_004_wk_application_bit_id_tag_check",
+                      "wk_tag_005_wk_environment_name_tag_check",
+                      "wk_tag_008_wk_resource_name_tag_check",
+                      "wk_tag_009_wk_patch_class_tag_check"]
+}
+
+def get_account_id():
+    try:
+        response = sts_client.get_caller_identity()
+        return response['Account']
+    except Exception as e:
+        print(f"Error fetching Account ID: {e}")
+        return "N/A"
+
+def write_to_csv(data, csv_file_path):
+    """Writes the collected compliance data to a CSV file."""
+    with open(csv_file_path, mode='w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=[
+            "Name", "Location", "Account ID", "Account Name", "Compliance","Resource ID", "Resource Type",
+             "Reason", "Evaluation Time", "Bit ID", "Environment", "Additional Bit Ids"
+        ])
+        writer.writeheader()
+        writer.writerows(data)
+
+
+class TagRule(ABC):
+    supported_resource_types = ["ec2", "elasticloadbalancing", "s3", "rds", "cloudfront", "storagegateway",
+                                "elasticfilesystem"]
+    supported_resource_types_ec2 = ["instance", "vpc", "subnet", "route-table", "internet-gateway", "natgateway",
+                           "customer-gateway", "transit-gateway", "volume", "security-group", "network-acl",
+                           "networkacl", "dhcpoptions"]
+
+    supported_iam_list = [
+        "GBS-ITO-CloudOps-Support-NA-Global-AWS-Admins",
+        "GBS-ITO-CloudOps-Support-EU-Global-AWS-Admins",
+        "GBS-ITO-CloudOps-Support-NA-Global-AWS-ReadOnly",
+        "GBS-ITO-CloudOps-Support-EU-Global-AWS-ReadOnly",
+        "AWSReservedSSO_CIEM-InfraOpsSupportAdmin",
+        "AWSReservedSSO_CIEM-InfraOpsSupportReader",
+        "AWSServiceRoleForSupport",
+        "WK-Custom-AdministratorAccess",
+        "WK-Custom-AmazonSSMManagedInstanceCore",
+        "WK-Custom-Billing",
+        "WK-Custom-NetworkAdministrator",
+        "WK-Custom-OrganizationAccountAccessRole",
+        "WK-Custom-PowerUserAccess",
+        "WK-Custom-S3Reader",
+        "WK-Custom-StandardAdministrator",
+        "WK-Custom-SystemAdministrator",
+        "WK-Custom-ViewOnlyAccess",
+        "WK-Custom-WK-DBA",
+        "AWSReservedSSO_AdministratorAccess_",
+        "AWSReservedSSO_BillingViewOnly_",
+        "AWSReservedSSO_NetworkAdministrator_",
+        "AWSReservedSSO_PowerUserAccess_",
+        "AWSReservedSSO_Readonlyaccess-Global_",
+        "AWSReservedSSO_StandardAdministrator_",
+        "AWSReservedSSO_SystemAdministrator_",
+        "AWSReservedSSO_ViewOnlyAccess_"]
+
+    @abstractmethod
+    def is_compliant(self, tags) -> bool:
+        """Check if the resource is compliant with this rule."""
+        pass
+
+    @abstractmethod
+    def get_rule_name(self) -> str:
+            """Return a name of the compliance rule."""
+            return "rule name"
+
+    def get_bitid_metadata(self, resource_tag_mapping):
+        tag_values = {
+            'bit_id': None,
+            'environment': None,
+            'additional_bit_ids': None
+        }
+        return tag_004_data.get(resource_tag_mapping['ResourceARN'], tag_values)
+
+    def is_res_type_exempt(self, resoure_arn):
+        is_res_type_exempt = True
+        chunks = resoure_arn.split(":")
+        if chunks[2] in self.supported_resource_types:
+            if chunks[2] == "ec2":
+                if chunks[5].split('/')[0] in self.supported_resource_types_ec2:
+                    is_res_type_exempt = False
+            elif chunks[2] == 'iam':
+                role_name = resoure_arn.split('/')[-1]
+                if role_name in self.supported_iam_list:
+                    is_res_type_exempt = False
+            else:
+                is_res_type_exempt = False
+        return is_res_type_exempt
+
+    def is_resource_exempted(self, resource_id, rule_name, exception_entities):
+        today = datetime.now().date()
+        for entity in exception_entities:
+            expirationdate = datetime.fromisoformat(str(entity['ExpirationDate'])).date()
+            resource_exception = (
+                    entity['PartitionKey'] == resource_id and entity['RowKey'] == rule_name and expirationdate > today
+            )
+            if resource_exception:
+                compliance = 'EXEMPTED'
+
+        if rule_name in exempted_rules_agg_domains:
+            print(f"{resource_id} exempted as the associated domain is exempted")
+            compliance = 'EXEMPTED'
+
+    def get_resource_type(self, resource_id):
+        capital_letter_services = ['iam', 'ssm', 'ec2', 's3']
+        if resource_id.startswith("arn"):
+            s = resource_id.split("/")
+            split = s[0].split(":")
+            if split[2] in capital_letter_services:
+                split[2] = split[2].upper()
+            else:
+                split[2] = split[2].capitalize()
+            if split[2] == 'S3' and not split[3] and not split[4]:
+                resource_type = 'AWS::S3::Bucket'
+            elif split[2] == 'Apigateway':
+                resource_type = 'AWS::ApiGateway'
+            elif split[2] == 'Sqs':
+                resource_type = 'AWS::SQS'
+            elif split[2] == 'Sns':
+                resource_type = 'AWS::SNS'
+            else:
+                resource_type = 'AWS::' + split[2] + '::' + split[5].capitalize()
+        else:
+            if resource_id.startswith("vpc-"):
+                resource_type = 'AWS::EC2::VPC'
+            elif resource_id.startswith("subnet-"):
+                resource_type = 'AWS::EC2::Subnet'
+            elif resource_id.startswith("i-"):
+                resource_type = 'AWS::EC2::Instance'
+        return resource_type
+
+    def get_evaluation(self, resource_tag_mapping):
+        tags_metadata = self.get_bitid_metadata(resource_tag_mapping)
+        compliance, reason = self.is_compliant(resource_tag_mapping)
+        resource_data = {
+            "Name": self.get_rule_name(),
+            "Location": region,
+            "Account ID": account_id,
+            "Account Name": "N/A",  # Todo Fetch account name
+            "Compliance": compliance,
+            "Resource Type": self.get_resource_type(resource_tag_mapping.get('ResourceARN')),
+            "Resource ID": resource_tag_mapping['ResourceARN'],
+            "Reason": reason,
+            "Evaluation Time": datetime.now().isoformat(),
+            "Bit ID": tags_metadata["bit_id"],
+            "Environment": tags_metadata["environment"],
+            "Additional Bit Ids": tags_metadata["additional_bit_ids"]
+        }
+        return resource_data
+
+
+class Tag004(TagRule):
+    supported_resource_types = ["ec2", "elasticloadbalancing", "s3", "rds", "cloudfront", "storagegateway",
+                               "elasticfilesystem", 'config', 'backup', 'ssm']
+
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        """Check compliance for tag004"""
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        tag_values = {
+            'bit_id': None,
+            'environment': None,
+            'additional_bit_ids': None
+        }
+
+        for tag in resource_tag_mapping['Tags']:
+            key = tag['Key']
+            value = tag['Value'] or "None"
+
+            if key == 'wk_application_bit_id':
+                tag_values['bit_id'] = value
+                if self.app_bit_id_tag_is_valid(value):
+                    compliance = 'COMPLIANT'
+                    reason = None
+            elif key == 'wk_environment_name':
+                tag_values['environment'] = value
+            elif key == 'wk_additional_bit_ids':
+                tag_values['additional_bit_ids'] = value
+        reason_parts = []
+        if tag_values['bit_id']:
+            reason_parts.append(f"bitid is: {tag_values['bit_id']}")
+        if tag_values['environment']:
+            reason_parts.append(f"env is: {tag_values['environment']}")
+        if tag_values['additional_bit_ids']:
+            reason_parts.append(f"bitids are: {tag_values['additional_bit_ids']}")
+
+        reason = ";; ".join(reason_parts) if reason_parts else "None"
+        return compliance, reason
+
+    def app_bit_id_tag_is_valid(self, tag):
+        """Validates the wk_application_bit_id tag using regex."""
+        return re.fullmatch(r'^0[478]\d{2}[A-Za-z0-9]{8}$', tag) is not None
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_004_wk_application_bit_id_tag_check"
+
+    def get_bitid_metadata(self,resource_tag_mapping):
+        tag_values = {
+            'bit_id': None,
+            'environment': None,
+            'additional_bit_ids': None
+        }
+        for tag in resource_tag_mapping['Tags']:
+            key = tag['Key']
+            value = tag['Value'] or "None"
+
+            if key == 'wk_application_bit_id':
+                tag_values['bit_id'] = value
+            elif key == 'wk_environment_name':
+                tag_values['environment'] = value
+            elif key == 'wk_additional_bit_ids':
+                tag_values['additional_bit_ids'] = value
+        tag_004_data[resource_tag_mapping['ResourceARN']] = tag_values
+        return tag_values
+
+
+class Tag001(TagRule):
+    wk_compliant_div_code = ["d001", "d002", "d003", "d004", "d005", "d006", "d007", "d009", "d010", "d011"]
+
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        for tag in resource_tag_mapping['Tags']:
+            if (tag['Key'] == 'wk_division_code') and (tag['Value'] in self.wk_compliant_div_code):
+                compliance = 'COMPLIANT'
+                reason = ""
+        return compliance, reason
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_001_wk_division_code_tag_check"
+
+class Tag002(TagRule):
+    wk_compliant_div_code = ["d001", "d002", "d003", "d004", "d005", "d006", "d007", "d009", "d010", "d011"]
+
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        for tag in resource_tag_mapping['Tags']:
+            if (tag['Key'] == 'wk_bu_code') and self.value_is_valid_bu_code(tag['Value']):
+                compliance = 'COMPLIANT'
+                reason = ""
+        return compliance, reason
+
+    def value_is_valid_bu_code(self, tag):
+        return re.fullmatch(r'b\d{3}', tag) is not None
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_002_wk_bu_code_tag_check"
+
+class Tag005(TagRule):
+    environment_abbreviations = ["prd", "stg", "qae", "non", "dre", "dev", "prf", "int", "tst", "uat"]
+
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        for tag in resource_tag_mapping['Tags']:
+            if (tag['Key'] == 'wk_environment_name') and (tag['Value'] in self.environment_abbreviations):
+                compliance = 'COMPLIANT'
+                reason = ""
+        return compliance, reason
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_005_wk_environment_name_tag_check"
+
+class Tag008(TagRule):
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        for tag in resource_tag_mapping['Tags']:
+            if (tag['Key'] == 'wk_resource_name') and (tag['Value'].islower()):
+                compliance = 'COMPLIANT'
+                reason = ""
+        return compliance, reason
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_008_wk_resource_name_tag_check"
+
+
+class Tag009(TagRule):
+    supported_resource_types = ["ec2"]
+    supported_resource_types_ec2 = ["instance"]
+    regex_compliant_patchclass = r'^C([1-5])W([1-4])L?N?R?(M|T|W|R|F|S|U)'
+    allowedpatchvalues = ["appliance", "manual"]
+
+    def is_compliant(self, resource_tag_mapping) -> (str, str):
+        compliance = "NON_COMPLIANT"
+        reason =  "No tags or missing required tags"
+        for tag in resource_tag_mapping['Tags']:
+            if tag['Key'] == 'wk_patch_class':
+                if tag['Value'].lower() in self.allowedpatchvalues:
+                    compliance = 'COMPLIANT'
+                    reason = ""
+                elif self.value_is_a_patch_class(tag['Value']):
+                    compliance = 'COMPLIANT'
+                    reason = ""
+                else:
+                    compliance = "NON_COMPLIANT"
+                    reason = "Wrong Tag Value"
+        return compliance, reason
+
+    def value_is_valid_bu_code(self, tag):
+        return re.fullmatch(r'b\d{3}', tag) is not None
+
+    def get_rule_name(self) -> str:
+        return "wk_tag_009_wk_patch_class_tag_check"
+
+    def value_is_a_patch_class(self, tag_value):
+        if re.search(self.regex_compliant_patchclass, tag_value, re.IGNORECASE) is not None:
+            return re.search(self.regex_compliant_patchclass, tag_value, re.IGNORECASE)
+        return None
+
+def get_resources_evaluation_w_tags(region: str):
+        resourcetagging = boto3.client('resourcegroupstaggingapi', region_name=region)
+
+        #fetch resources
+        tag_rules = [Tag004(), Tag001(), Tag002(), Tag005(), Tag008(), Tag009()]
+        #tag_rules = [Tag004(), Tag008()]
+        resource_paginator = resourcetagging.get_paginator('get_resources')
+        pages = resource_paginator.paginate()
+        all_evaluation = []
+        for page in pages:
+            for resource_tag_mapping in page['ResourceTagMappingList']:
+                for rule in tag_rules:
+                    if not (rule.get_rule_name() in exempted_resources_map):
+                        exempted_resources_map[rule.get_rule_name()] = exception_list(rule.get_rule_name())
+                    if rule.is_res_type_exempt(resource_tag_mapping["ResourceARN"]):
+                        continue
+                    if 'Tags' in resource_tag_mapping and len(resource_tag_mapping['Tags']) > 0:
+                        evaluation = rule.get_evaluation(resource_tag_mapping)
+                        all_evaluation.append(evaluation)
+        return all_evaluation
+
+def get_resources_evaluation_wo_tags(region: str):
+    """Get resources that do not have the required tags."""
+    resource_compliance = []
+    rec = boto3.client('resource-explorer-2', region_name=region)
+    tag_rules = [Tag004(), Tag001(), Tag002(), Tag005(), Tag008(), Tag009()]
+    #tag_rules = [Tag004(), Tag008()]
+    for rule in tag_rules:
+        try:
+            res = rec.search(
+                QueryString=f'tag:none -service:cloudwatch -resourcetype:ec2:instance region:{region}')
+            for resource in res['Resources']:
+                if rule.is_res_type_exempt(resource["Arn"]):
+                    continue
+                resource_compliance.append({
+                    "Name": rule.get_rule_name(),
+                    "Location": region,
+                    "Account ID": account_id,
+                    "Account Name": "N/A", # TODO account name can be fetched
+                    "Compliance": 'NON_COMPLIANT',
+                    "Resource Type": rule.get_resource_type(resource['Arn']),
+                    "Resource ID": resource['Arn'],
+                    "Reason": "No tags or missing required tags",
+                    "Evaluation Time": datetime.now().isoformat(),
+                    "Bit ID": "",
+                    "Environment": "",
+                    "Additional Bit Ids": ""
+                })
+        except Exception as e:
+            print(f"Error fetching resources without tags: {e}")
+
+    return resource_compliance
+
+def get_domain_exemptions(account_id: str):
+    """
+    Returns list of domains which are to be exempted for given account
+    """
+    domains_to_exempt = []
+    connection_string = os.getenv("exemption_table_conn")
+    table_name = "ResourceException"
+    service = TableServiceClient.from_connection_string(conn_str=connection_string)
+    table_client = service.get_table_client(table_name)
+    query_filter_domains = " or ".join([f"RowKey eq '{key}'" for key in domain_rulename_map.keys()])
+    query_filter = f"({query_filter_domains}) and AccountID eq '{account_id}'"
+    records = list(table_client.query_entities(
+        query_filter=query_filter
+    ))
+    for record in records:
+        expiration_date = datetime.fromisoformat(str(record['ExpirationDate'])).date()
+        if expiration_date >= datetime.now().date():
+            domains_to_exempt.append(record["RowKey"])
+    return domains_to_exempt
+
+def exception_list(policy):
+    connection_string = os.getenv("exemption_table_conn")
+    table_name = "ResourceExemption"
+    service = TableServiceClient.from_connection_string(conn_str=connection_string)
+    table_client = service.get_table_client(table_name)
+    query_filter = f"RowKey eq '{policy}'"
+    entities = list(table_client.query_entities(
+        query_filter=query_filter
+    ))
+    return entities
+
+
+import argparse
+import os
+
+
+# Function to parse arguments passed to the script
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Sample Python script for Azure DevOps pipeline')
+
+    # Define the arguments
+    parser.add_argument('--param1', type=str, required=True, help='Parameter 1')
+    parser.add_argument('--param2', type=str, required=True, help='Parameter 2')
+
+    return parser.parse_args()
+
+
+def main():
+    # Parse command-line arguments
+    args = parse_arguments()
+
+    # Print the received arguments
+    print(f"Received param1: {args.param1}")
+    print(f"Received param2: {args.param2}")
+    print(os.getenv("MY_ENV_VAR"))
+
+
+if __name__ == '__main__':
+    print("Test Invocation")
+    main()
+
+    # all_data = []
+    # account_id = get_account_id()
+    # yesterday = datetime.fromisoformat(str(datetime.now() - timedelta(days=1))).date()
+    # session = boto3.session.Session()
+    # awssecret = session.client(
+    #     service_name='secretsmanager',
+    #     region_name="us-east-1"
+    # )
+    #
+    # exempted_domains = get_domain_exemptions(account_id)
+    # print(f"Exempted domains for account {account_id} : {exempted_domains}")
+    # exempted_rules_agg_domains = [item for key, value in domain_rulename_map.items() if key in exempted_domains for item
+    #                               in value]
+    # print(f"Exempted Rules as per Exempted Domains for account {account_id} : {exempted_rules_agg_domains}")
+    # print(exempted_rules_agg_domains)
+    #
+    # for region in wk_supported_regions:
+    #     print(f"Processing Region:{region}")
+    #     resources_evaluation_w_tags = get_resources_evaluation_w_tags(region)
+    #     resources_evaluation_wo_tags = get_resources_evaluation_wo_tags(region)
+    #
+    #     all_data = all_data+resources_evaluation_w_tags+resources_evaluation_wo_tags
+    #
+    # wk_supported_resource_types = [
+    #     "AWS::EC2::Instance",
+    #     "AWS::Rds::Db",
+    #     "AWS::EC2::VPC",
+    #     "AWS::EC2::Subnet",
+    #     "AWS::EC2::Route-table",
+    #     "AWS::EC2::Internet-gateway",
+    #     "AWS::EC2::Natgateway",
+    #     "AWS::EC2::Customer-gateway",
+    #     "AWS::EC2::Transit-gateway",
+    #     "AWS::Elasticloadbalancing::Loadbalancer",
+    #     "AWS::Cloudfront::Distribution",
+    #     "AWS::EC2::Volume",
+    #     "AWS:Storagegateway",
+    #     "AWS::Elasticfilesystem::File-system",
+    #     "AWS::EC2::Security-group",
+    #     "AWS::EC2::Network-acl",
+    #     "AWS::EC2::NetworkAcl",
+    #     "AWS::S3::Bucket",
+    #     'AWS::Config::ConfigurationRecorder',
+    #     'AWS::IAM::Role',
+    #     'AWS::::Account',
+    #     'AWS::Backup::BackupVault',
+    #     'AWS::EC2::DHCPOptions',
+    #     'AWS::SSM::PatchCompliance'
+    # ]
+    #
+    # def is_resource_exempted(resource_id, rule_name, compliance, exception_entities):
+    #     today = datetime.now().date()
+    #     for entity in exception_entities:
+    #         expiration_date = datetime.fromisoformat(str(entity['ExpirationDate'])).date()
+    #         resource_exception = (
+    #                 entity['PartitionKey'] == resource_id and entity['RowKey'] == rule_name and expiration_date > today
+    #         )
+    #         if resource_exception:
+    #             compliance = 'EXEMPTED'
+    #
+    #     if rule_name in exempted_rules_agg_domains:
+    #         print(f"{resource_id} exempted as the associated domain is exempted")
+    #         compliance = 'EXEMPTED'
+    #     return compliance
+    #
+    # final_data = []
+    # for i,data in enumerate(all_data):
+    #     if data["Resource Type"] in wk_supported_resource_types:
+    #         data["Compliance"] = is_resource_exempted(data["Resource ID"],
+    #                                                   data["Name"],
+    #                                                   data["Compliance"],
+    #                                                   exempted_resources_map[data["Name"]])
+    #         final_data.append(data)
+    # write_to_csv(final_data, csv_file_path = f'compliance_report_{account_id}.csv')
+    #
+    #
